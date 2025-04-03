@@ -941,8 +941,12 @@ typedef void *rb_jmpbuf_t[5];
   environments.
 */
 typedef struct _rb_vm_tag_jmpbuf {
-    struct _rb_vm_tag_jmpbuf *next;
     rb_jmpbuf_t buf;
+    struct _rb_vm_tag_jmpbuf *parent;
+    struct _rb_vm_tag_jmpbuf *last_child;
+    struct _rb_vm_tag_jmpbuf *prev_sibling;
+    struct _rb_vm_tag_jmpbuf *next_sibling;
+    bool has_setjmp;
 } *rb_vm_tag_jmpbuf_t;
 
 #define RB_VM_TAG_JMPBUF_GET(jmpbuf) ((jmpbuf)->buf)
@@ -967,47 +971,59 @@ struct rb_vm_tag {
 
 #if defined(__wasm__) && !defined(__EMSCRIPTEN__)
 static inline void
-_rb_vm_tag_jmpbuf_deinit_internal(rb_vm_tag_jmpbuf_t jmpbuf)
+rb_vm_tag_jmpbuf_deinit(const rb_vm_tag_jmpbuf_t *jmpbuf)
 {
-    rb_vm_tag_jmpbuf_t buf = jmpbuf;
-    while (buf != NULL) {
-        rb_vm_tag_jmpbuf_t next = buf->next;
-        ruby_xfree(buf);
-        buf = next;
+    rb_vm_tag_jmpbuf_t buf = *jmpbuf;
+
+    /* Free all the descendants of this jump buffer */
+    for (rb_vm_tag_jmpbuf_t child = buf->last_child; child != NULL; child = child->prev_sibling) {
+        rb_vm_tag_jmpbuf_deinit(&child);
     }
+
+    /* Remove the references to this jump buffer from its siblings and parent */
+    if (buf->prev_sibling != NULL) {
+        buf->prev_sibling->next_sibling = buf->next_sibling;
+    }
+    if (buf->next_sibling != NULL) {
+        buf->next_sibling->prev_sibling = buf->prev_sibling;
+    } else if (buf->parent != NULL) {
+        buf->parent->last_child = buf->prev_sibling;
+    }
+
+    /* Free this jump buffer */
+    ruby_xfree(buf);
 }
 
 static inline void
-rb_vm_tag_jmpbuf_init(struct rb_vm_tag *tag)
+rb_vm_tag_jmpbuf_init(rb_vm_tag_jmpbuf_t *jmpbuf, struct rb_vm_tag *prev)
 {
-    if (tag->prev != NULL && tag->prev->buf->next != NULL) {
-        _rb_vm_tag_jmpbuf_deinit_internal(tag->prev->buf->next);
-        tag->prev->buf->next = NULL;
+    /* Free all the descendants of the parent jump buffer if it has a setjmp handler attached to it */
+    if (prev != NULL && prev->buf->has_setjmp && prev->buf->last_child != NULL) {
+        for (rb_vm_tag_jmpbuf_t child = prev->buf->last_child; child != NULL; child = child->prev_sibling) {
+            rb_vm_tag_jmpbuf_deinit(&child);
+        }
     }
-    tag->buf = ruby_xmalloc(sizeof *tag->buf);
-    tag->buf->next = NULL;
-    if (tag->prev != NULL) {
-        tag->prev->buf->next = tag->buf;
-    }
-}
 
-static inline void
-rb_vm_tag_jmpbuf_deinit(struct rb_vm_tag *tag)
-{
-    if (tag->prev != NULL) {
-        tag->prev->buf->next = NULL;
+    rb_vm_tag_jmpbuf_t buf = *jmpbuf = ruby_xmalloc(sizeof **jmpbuf);
+    buf->has_setjmp = false;
+    buf->last_child = buf->next_sibling = NULL;
+    if (prev == NULL) {
+        buf->parent = buf->prev_sibling = NULL;
+    } else {
+        buf->parent = prev->buf;
+        buf->prev_sibling = buf->parent->last_child;
+        buf->prev_sibling->next_sibling = buf->parent->last_child = buf;
     }
-    _rb_vm_tag_jmpbuf_deinit_internal(tag->buf);
 }
 #else
 static inline void
-rb_vm_tag_jmpbuf_init(struct rb_vm_tag *tag)
+rb_vm_tag_jmpbuf_init(rb_vm_tag_jmpbuf_t *jmpbuf, struct rb_vm_tag *prev)
 {
     // no-op
 }
 
 static inline void
-rb_vm_tag_jmpbuf_deinit(struct rb_vm_tag *tag)
+rb_vm_tag_jmpbuf_deinit(const rb_vm_tag_jmpbuf_t *jmpbuf)
 {
     // no-op
 }
